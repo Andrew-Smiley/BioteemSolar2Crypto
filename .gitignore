@@ -1,0 +1,9 @@
+config.py
+state.json
+override.json
+verbose.json
+daily_stats.json
+controller.log
+__pycache__/
+*.pyc
+venv/

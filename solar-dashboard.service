@@ -1,0 +1,20 @@
+[Unit]
+Description=Solar miner web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root so PAM's password check has the access it needs on a
+# fresh Pi install without extra group/permission setup. If you'd rather
+# not run this as root, try User=pi first -- it often works fine because
+# the check goes through the setuid unix_chkpwd helper -- and only fall
+# back to root if you hit permission errors on login.
+User=root
+WorkingDirectory=/home/admin/solar_miner_controller
+ExecStart=/usr/bin/python3 /home/admin/solar_miner_controller/dashboard.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

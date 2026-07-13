@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Solar Miner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="bg-glow"></div>
+
+  <header>
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <h1>Solar<span>Miner</span></h1>
+    </div>
+    <div class="conn-status">
+      <span class="dot" id="connDot"></span>
+      <span id="connText">connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="gauge-wrap">
+        <svg viewBox="0 0 240 240" class="gauge">
+          <circle class="gauge-track" cx="120" cy="120" r="104"></circle>
+          <circle class="gauge-fill" id="gaugeFill" cx="120" cy="120" r="104"></circle>
+        </svg>
+        <div class="gauge-center">
+          <div class="gauge-value"><span id="powerValue">--</span><span class="gauge-unit">kW</span></div>
+          <div class="gauge-caption" id="powerCaption">of 100kW export cap</div>
+        </div>
+      </div>
+      <div class="hero-meta">
+        <div class="state-pill" id="statePill">—</div>
+        <div class="array-note">160kW array · 100kW export cap</div>
+      </div>
+    </section>
+
+    <section class="rigs" id="rigs">
+      <!-- rig cards injected by app.js -->
+    </section>
+
+    <section class="log-panel">
+      <div class="log-header">
+        <h2>Event log</h2>
+        <span class="log-sub">most recent first</span>
+      </div>
+      <ul class="log-list" id="logList"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
