@@ -40,6 +40,7 @@ import avalon_ctl
 import notifier
 import state_store
 import daily_stats
+import f2pool_api
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,6 +132,9 @@ def build_daily_summary(power_kw, active_rig_ips: list, total_rigs: int) -> str:
         lines.append(f"  {ip}: {hours:.1f}h active (~{kwh:.1f} kWh est.)")
     lines.append(f"Total rig runtime: {total_hours:.1f}h, ~{total_kwh:.1f} kWh burned (est. at {rig_power_est}kW/rig)")
 
+    if getattr(config, "F2POOL_ENABLED", False):
+        lines.append(f2pool_api.get_daily_summary_line(config.F2POOL_CURRENCY, config.F2POOL_USERNAME, config.F2POOL_API_TOKEN))
+
     notable = [e["message"] for e in events if e["level"] in ("warn", "error")]
     if notable:
         shown = notable[:10]
@@ -142,19 +146,53 @@ def build_daily_summary(power_kw, active_rig_ips: list, total_rigs: int) -> str:
     return "\n".join(lines)
 
 
+def probe_actual_active_rigs() -> list:
+    """
+    On startup, query each rig's REAL current state rather than assuming
+    none are active. Without this, a service restart (whether deliberate,
+    a crash, or a reboot) would reset the in-memory active_rig_ips to []
+    regardless of what the rig is physically doing -- if a rig was left
+    mining from an earlier manual override or a previous session, the
+    automatic idle-trigger logic would never fire for it, because it'd
+    believe there was nothing to turn off. This is exactly what caused a
+    rig to keep mining overnight after several service restarts during
+    testing: it wasn't idled by anything, because nothing thought it was
+    ever turned on in the first place.
+    """
+    active = []
+    for ip in config.RIG_IPS:
+        status = avalon_ctl.get_status(ip)
+        if not status.get("reachable"):
+            continue
+        hashrate = status.get("hashrate_ths") or 0
+        fan = status.get("fan_pct")
+        looks_active = hashrate > 0 or (fan not in (None, "0", "0%"))
+        if looks_active:
+            active.append(ip)
+    return active
+
+
 def main():
     client = solis_api.SolisClient(
         config.SOLIS_KEY_ID, config.SOLIS_KEY_SECRET, config.SOLIS_PLANT_ID
     )
 
     total_rigs = len(config.RIG_IPS)
-    active_rig_ips = []  # rigs currently commanded to MAX, in activation order
+    active_rig_ips = probe_actual_active_rigs()
     consecutive_errors = 0
     unreachable_rigs = set()
     last_step_at = 0.0
     was_overridden = False
 
-    notifier.send("Solar miner controller started.", level="info", telegram=True)
+    if active_rig_ips:
+        notifier.send(
+            f"Solar miner controller started -- found {len(active_rig_ips)} rig(s) already "
+            f"actively mining on startup ({', '.join(active_rig_ips)}). Picking up from there "
+            f"rather than assuming they're idle.",
+            level="warn",
+        )
+    else:
+        notifier.send("Solar miner controller started.", level="info", telegram=True)
 
     while True:
         power_kw = None
@@ -241,6 +279,21 @@ def main():
 
         control_state = "idle" if not active_rig_ips else ("max" if len(active_rig_ips) == total_rigs else "partial")
         rig_statuses = collect_rig_statuses(active_rig_ips)
+
+        # Safety net: if we believe a rig is idle but it's actually still
+        # hashing (whatever the cause -- missed a restart-recovery case,
+        # a command silently failed to stick, manual physical
+        # intervention, etc.), re-issue idle and flag it loudly rather
+        # than silently trusting our own belief about its state.
+        for ip, status in rig_statuses.items():
+            if ip not in active_rig_ips and status.get("reachable") and (status.get("hashrate_ths") or 0) > 0:
+                notifier.send(
+                    f"Rig {ip} was believed idle but is actually hashing "
+                    f"({status.get('hashrate_ths')} TH/s) -- re-sending idle command.",
+                    level="warn",
+                )
+                set_single_rig(ip, "idle", unreachable_rigs)
+
         state_store.write_state(power_kw, control_state, rig_statuses, connection_ok, override=override)
 
         summary_hour = getattr(config, "DAILY_SUMMARY_HOUR", 18)

@@ -89,15 +89,29 @@ def parse_stats(raw: str) -> dict:
     fields = dict(_FIELD_RE.findall(raw))
     result = {}
 
-    # Hashrate: prefer the averaged figure over the instantaneous one
-    ghs = fields.get("GHSavg") or fields.get("GHSspd") or fields.get("MGHS")
-    if ghs:
+    # Hashrate: prefer the INSTANTANEOUS reading (GHSspd) over the
+    # averaged one (GHSavg/GHSmm/MGHS). The averages are computed over a
+    # trailing window and don't drop to zero right away after the rig
+    # goes idle -- using them as "current hashrate" made a freshly-idled
+    # rig look like it was still mining at full tilt for a while after.
+    # GHSspd genuinely reads 0.00 the moment it's idle, which is what a
+    # "right now" dashboard figure should show.
+    ghs = fields.get("GHSspd")
+    if ghs is None:
+        ghs = fields.get("GHSavg") or fields.get("MGHS")
+    if ghs is not None:
         try:
             result["hashrate_ths"] = round(float(ghs) / 1000, 2)
         except ValueError:
             pass
 
-    temp = fields.get("TAvg") or fields.get("ITemp")
+    # Temp: TAvg reads 0 while idle (no active hashing to average across),
+    # which would make an idled rig look stone cold when it may still be
+    # warm. Fall back to the hashboard outlet temp, which reflects actual
+    # current board temperature regardless of mining state.
+    temp = fields.get("TAvg")
+    if not temp or float(temp) == 0:
+        temp = fields.get("HBOTemp") or fields.get("ITemp")
     if temp:
         try:
             result["temp_c"] = float(temp)

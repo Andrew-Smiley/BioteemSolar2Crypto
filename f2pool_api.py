@@ -56,15 +56,15 @@ def get_balance_info(currency: str, username: str, token: str) -> dict:
     return data["balance_info"]
 
 
-def get_price_usd(currency: str) -> float:
+def get_price_cad(currency: str) -> float:
     coingecko_id = COIN_INFO.get(currency, {}).get("coingecko_id", currency)
     resp = requests.get(
         COINGECKO_PRICE_URL,
-        params={"ids": coingecko_id, "vs_currencies": "usd"},
+        params={"ids": coingecko_id, "vs_currencies": "cad"},
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()[coingecko_id]["usd"]
+    return resp.json()[coingecko_id]["cad"]
 
 
 def _yesterday_reflects_today() -> bool:
@@ -105,8 +105,8 @@ def get_daily_summary_line(currency: str, username: str, token: str) -> str:
         label = "today so far (partial, still updating)"
 
     try:
-        price = get_price_usd(currency)
-        usd_value = coin_amount * price
-        return f"F2Pool: {coin_amount:.8f} {ticker} mined {label} (~${usd_value:,.2f} at ${price:,.0f}/{ticker})"
+        price = get_price_cad(currency)
+        cad_value = coin_amount * price
+        return f"F2Pool: {coin_amount:.8f} {ticker} mined {label} (~${cad_value:,.2f} CAD at ${price:,.0f} CAD/{ticker})"
     except Exception:
         return f"F2Pool: {coin_amount:.8f} {ticker} mined {label} (price lookup failed)"

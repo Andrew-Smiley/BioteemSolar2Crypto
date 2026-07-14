@@ -58,8 +58,6 @@ HELP_TEXT = (
     "  help -- this list"
 )
 
-# How long a manual override holds before automatically expiring back to
-# automatic control. Falls back to 2 hours if not set in config.py.
 OVERRIDE_TTL_SEC = getattr(config, "OVERRIDE_TTL_SEC", 2 * 60 * 60)
 
 
@@ -109,16 +107,13 @@ def format_status() -> str:
         age = time.time() - updated_at
         lines.append(f"(as of {age:.0f}s ago)")
 
-
     if getattr(config, "F2POOL_ENABLED", False):
         lines.append(f2pool_api.get_daily_summary_line(config.F2POOL_CURRENCY, config.F2POOL_USERNAME, config.F2POOL_API_TOKEN))
+
     return "\n".join(lines)
 
 
 def apply_manual_command(mode: str) -> str:
-    """mode is 'idle' or 'max'. Sets the rigs immediately (so you get fast
-    feedback) and sets the override so the controller doesn't undo it on
-    its next poll."""
     results = []
     for ip in config.RIG_IPS:
         try:
@@ -146,17 +141,19 @@ def clear_manual_override() -> str:
     return "No manual override was active."
 
 
-def send_message(text: str):
+def send_message(text: str, chat_id: str = None):
+    if chat_id is None:
+        chat_id = config.TELEGRAM_CHAT_ID
     try:
         resp = requests.post(
             f"{API_BASE}/sendMessage",
-            data={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
+            data={"chat_id": chat_id, "text": text},
             timeout=10,
         )
         if not resp.ok:
-            log.warning(f"sendMessage failed: {resp.status_code} {resp.text[:200]}")
+            log.warning(f"sendMessage to {chat_id} failed: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
-        log.warning(f"sendMessage raised: {e}")
+        log.warning(f"sendMessage to {chat_id} raised: {e}")
 
 
 def set_verbose_mode(enabled: bool) -> str:
@@ -187,6 +184,22 @@ def handle_text(text: str) -> str:
     return f"Not sure what you mean.\n\n{HELP_TEXT}"
 
 
+def _channel_matches(chat: dict) -> bool:
+    """
+    True if this chat is the configured broadcast channel. Handles both
+    ways TELEGRAM_CHANNEL_CHAT_ID might be set: a numeric id ("-100...")
+    compared directly, or a "@username" compared against the channel's
+    username field (public channels only carry a username, not vice versa).
+    """
+    configured = str(getattr(config, "TELEGRAM_CHANNEL_CHAT_ID", "") or "")
+    if not configured:
+        return False
+    if configured.startswith("@"):
+        username = chat.get("username")
+        return username is not None and f"@{username}".lower() == configured.lower()
+    return str(chat.get("id", "")) == configured
+
+
 def main():
     offset = 0
     log.info("Telegram listener started, polling for messages...")
@@ -202,19 +215,40 @@ def main():
 
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
-                message = update.get("message", {})
-                chat_id = str(message.get("chat", {}).get("id", ""))
-                text = message.get("text") or ""
 
-                if chat_id != str(config.TELEGRAM_CHAT_ID):
-                    log.info(f"Ignoring message from unrecognized chat_id {chat_id}")
-                    continue
+                message = update.get("message")
+                channel_post = update.get("channel_post")
 
-                if text.strip():
-                    send_message(handle_text(text))
+                if message:
+                    chat = message.get("chat", {})
+                    chat_id = str(chat.get("id", ""))
+                    text = message.get("text") or ""
+
+                    if chat_id != str(config.TELEGRAM_CHAT_ID):
+                        log.info(f"Ignoring message from unrecognized chat_id {chat_id}")
+                        continue
+
+                    if text.strip():
+                        send_message(handle_text(text))
+
+                elif channel_post:
+                    # Telegram doesn't expose WHICH admin posted a channel
+                    # message -- channel_post has no 'from' user field. We
+                    # can only verify this came from the configured
+                    # channel (equivalent to "from you" as long as you're
+                    # the only admin who can post there), not the poster's
+                    # individual identity.
+                    chat = channel_post.get("chat", {})
+                    text = channel_post.get("text") or ""
+
+                    if not _channel_matches(chat):
+                        continue
+
+                    if text.strip():
+                        send_message(handle_text(text), chat_id=chat.get("id"))
 
         except requests.exceptions.Timeout:
-            continue
+            continue  # normal with long polling, just try again
         except Exception as e:
             log.error(f"poll error: {e}")
             time.sleep(5)
