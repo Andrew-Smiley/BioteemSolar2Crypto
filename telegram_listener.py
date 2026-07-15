@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-Listens for incoming Telegram messages: replies with live status, and
-accepts a few manual control commands ("idle", "max"/"super", "auto").
+Listens for incoming Telegram messages: replies with live status, accepts
+manual control commands, and toggles verbose mode. Also responds to posts
+in the configured broadcast channel.
 
 Manual commands set an override (see state_store.set_override) that the
-main controller checks every poll cycle -- this is what stops the
-controller's own automatic logic from just flipping the rigs back within
-30 seconds of your command. The override expires on its own after
-OVERRIDE_TTL_SEC (so it can't be forgotten and left stuck), or "auto"
-clears it immediately.
+main controller checks every poll cycle, so the controller's automatic
+logic won't flip the rigs back. The override expires after OVERRIDE_TTL_SEC
+or when "auto" is sent.
 
-Runs as its own small process (its own systemd service) since it doesn't
-need to touch the control loop directly, just read/write the same
-state.json / override.json the controller already uses.
+Uses long polling (getUpdates) -- no public HTTPS endpoint needed.
 
-Uses long polling (Telegram's getUpdates) rather than a webhook -- no
-public HTTPS endpoint needed, just outbound internet from the Pi.
-
-Security note: only responds to messages from TELEGRAM_CHAT_ID (your own
-chat). Anyone else messaging the bot is silently ignored.
+Security note: only responds to messages from TELEGRAM_CHAT_ID and posts
+in the configured channel. Anything else is silently ignored.
 """
 
 import logging
@@ -48,7 +42,7 @@ HELP_TEXT = (
     "Commands:\n"
     "  status -- current power/rig state\n"
     "  idle -- force rigs to idle (manual override)\n"
-    "  max / super -- force rigs to max (manual override)\n"
+    "  max / super -- force rigs to super/max (manual override)\n"
     "  auto -- cancel manual override, resume automatic control\n"
     "  verbose / live -- get every event immediately instead of "
     "waiting for the 6pm daily summary\n"
@@ -93,7 +87,7 @@ def format_status() -> str:
         lines.append("Inverter connection: DOWN")
 
     for ip, rig in rigs.items():
-        commanded = rig.get("commanded_state", "?").upper()
+        commanded = rig.get("commanded_level", rig.get("commanded_state", "?")).upper()
         if rig.get("reachable"):
             hr = rig.get("hashrate_ths")
             temp = rig.get("temp_c")
@@ -114,13 +108,14 @@ def format_status() -> str:
 
 
 def apply_manual_command(mode: str) -> str:
+    """mode is 'idle' or 'max'. Sets the rigs immediately (so you get fast
+    feedback) and sets the override so the controller doesn't undo it on
+    its next poll. 'max' maps to the top running level (super)."""
+    level = "super" if mode == "max" else "idle"
     results = []
     for ip in config.RIG_IPS:
         try:
-            if mode == "idle":
-                avalon_ctl.go_idle(ip)
-            else:
-                avalon_ctl.go_max(ip)
+            avalon_ctl.set_level(ip, level)
             results.append(f"{ip}: ok")
         except (OSError, TimeoutError) as e:
             results.append(f"{ip}: unreachable ({e})")
@@ -128,7 +123,7 @@ def apply_manual_command(mode: str) -> str:
     state_store.set_override(mode, ttl_seconds=OVERRIDE_TTL_SEC)
     ttl_hours = OVERRIDE_TTL_SEC / 3600
     return (
-        f"Manual override set: {mode.upper()} for up to {ttl_hours:.1f}h "
+        f"Manual override set: {level.upper()} for up to {ttl_hours:.1f}h "
         f"(or until you send \"auto\").\n" + "\n".join(results)
     )
 
@@ -185,12 +180,6 @@ def handle_text(text: str) -> str:
 
 
 def _channel_matches(chat: dict) -> bool:
-    """
-    True if this chat is the configured broadcast channel. Handles both
-    ways TELEGRAM_CHANNEL_CHAT_ID might be set: a numeric id ("-100...")
-    compared directly, or a "@username" compared against the channel's
-    username field (public channels only carry a username, not vice versa).
-    """
     configured = str(getattr(config, "TELEGRAM_CHANNEL_CHAT_ID", "") or "")
     if not configured:
         return False
@@ -232,12 +221,6 @@ def main():
                         send_message(handle_text(text))
 
                 elif channel_post:
-                    # Telegram doesn't expose WHICH admin posted a channel
-                    # message -- channel_post has no 'from' user field. We
-                    # can only verify this came from the configured
-                    # channel (equivalent to "from you" as long as you're
-                    # the only admin who can post there), not the poster's
-                    # individual identity.
                     chat = channel_post.get("chat", {})
                     text = channel_post.get("text") or ""
 
@@ -248,7 +231,7 @@ def main():
                         send_message(handle_text(text), chat_id=chat.get("id"))
 
         except requests.exceptions.Timeout:
-            continue  # normal with long polling, just try again
+            continue
         except Exception as e:
             log.error(f"poll error: {e}")
             time.sleep(5)

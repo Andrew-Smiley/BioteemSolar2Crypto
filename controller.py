@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-Main control loop: poll SolisCloud for current output power, bring Avalon
-Q rigs online/offline one at a time as we approach the 100kW export cap.
-Publishes shared state for the dashboard.
+Main control loop: poll SolisCloud for current output power and drive both
+Avalon Q rigs together through power LEVELS (idle -> eco -> standard ->
+super) to soak up solar output near the 100kW export cap without exceeding
+it. Publishes shared state for the dashboard.
 
-Telegram notification policy (see notifier.py for the mechanism):
-  - Warnings/errors (rig unreachable, lost SolisCloud contact) -> immediate
-  - First rig activation of the day -> immediate
-  - Every other routine step (later activations, all deactivations) ->
-    dashboard-only, no phone ping
-  - A single daily summary at config.DAILY_SUMMARY_HOUR (default 6pm) with
-    event counts, rig runtime, estimated energy burned, and today's power
-    min/max/avg
+--- Control model ---
+Both rigs share a single level (they move together). Levels, in order:
+    idle (standby, ~0W) -> eco (~850W) -> standard (~1400W) -> super (~1674W)
 
-Rigs are staged on/off individually (not all switched at once) with a
-cooldown between steps -- see config.STEP_SETTLE_SEC. This matters because
-each rig's power draw is larger than the hysteresis band in some setups:
-switching both rigs on simultaneously can push the reading well below
-RAMP_DOWN_KW instantly, triggering an immediate reversal. Bringing rigs on
-one at a time and waiting to see where the reading settles avoids that.
+Ramp UP: while export reading is >= RAMP_UP_KW (default 99), step up one
+level, then wait STEP_SETTLE_SEC (default 60s) before considering the next
+step. The settle wait matters because each rig stepping up a level pulls
+its extra draw straight off the export reading -- without the wait we'd see
+that self-induced dip and immediately reverse (flap).
 
-Also checks for a manual override (set via Telegram -- see
-telegram_listener.py) each cycle: if one's active, automatic staged
-control is paused and ALL rigs are held at whatever the override says,
-until it expires or is cleared with "auto".
+Ramp DOWN: based on the current reading, at most one decision per settle
+interval:
+    97-99 kW  -> hold (target band, near the cap)
+    95-97 kW  -> step down 1 level
+    90-95 kW  -> step down 2 levels
+    < 90 kW   -> straight to idle, IMMEDIATELY (no settle wait) -- the
+                 fast-drop / cloud-cover case where reacting now matters
+                 more than avoiding a flap, and idle is the floor anyway.
 
-Run this under systemd (see solar-miner.service) so it restarts itself on
-crash or reboot.
+Recovery: if output climbs back to >= RAMP_UP_KW mid-descent, it resumes
+ramping up by the normal rule.
+
+Manual override (set via Telegram) pauses all of this and holds both rigs
+at idle or super until it expires or is cleared.
+
+Run under systemd so it restarts on crash/reboot.
 """
 
 import logging
@@ -52,55 +56,66 @@ logging.basicConfig(
 )
 log = logging.getLogger("controller")
 
+LEVELS = avalon_ctl.LEVELS  # ["idle", "eco", "standard", "super"]
 
-def set_single_rig(ip: str, state: str, unreachable_rigs: set) -> bool:
-    """Sets one rig to 'idle' or 'max'. Returns True on success. Tracks
-    unreachable_rigs so we only alert once per outage, not on every poll.
-    Also records the transition for the daily runtime/energy estimate."""
-    try:
-        if state == "idle":
-            result = avalon_ctl.go_idle(ip)
-        else:
-            result = avalon_ctl.go_max(ip)
-        log.info(f"rig {ip} -> {state}: {result[:120]}")
-        daily_stats.record_rig_transition(ip, state, config.RIG_IPS)
-        if ip in unreachable_rigs:
-            unreachable_rigs.discard(ip)
-            notifier.send(f"Rig {ip} back online, now set to {state}.", level="info")
-        return True
-    except (OSError, TimeoutError) as e:
-        log.warning(f"rig {ip} unreachable while setting {state}: {e}")
-        if ip not in unreachable_rigs:
-            unreachable_rigs.add(ip)
-            notifier.send(f"Rig {ip} unreachable while trying to set {state}: {e}", level="warn")
-        return False
+RAMP_UP_KW = getattr(config, "RAMP_UP_KW", 99.0)
+STEP_SETTLE_SEC = getattr(config, "STEP_SETTLE_SEC", 60)
+HOLD_FLOOR_KW = getattr(config, "HOLD_FLOOR_KW", 97.0)
+DOWN1_FLOOR_KW = getattr(config, "DOWN1_FLOOR_KW", 95.0)
+DOWN2_FLOOR_KW = getattr(config, "DOWN2_FLOOR_KW", 90.0)
 
 
-def set_rigs(state: str, unreachable_rigs: set):
-    """Sets ALL configured rigs to the same state at once -- used for
-    manual override and the safety fallback (lost SolisCloud contact),
-    NOT for normal automatic ramping, which brings rigs on/off one at a
-    time (see main())."""
+def set_all_rigs_level(level: str, unreachable_rigs: set):
+    """Command every reachable rig to `level`. Records transitions for the
+    daily energy estimate, and alerts once per rig on going unreachable /
+    coming back."""
     for ip in config.RIG_IPS:
-        set_single_rig(ip, state, unreachable_rigs)
+        try:
+            result = avalon_ctl.set_level(ip, level)
+            log.info(f"rig {ip} -> {level}: {result[:120]}")
+            daily_stats.record_rig_transition(ip, level, config.RIG_IPS)
+            if ip in unreachable_rigs:
+                unreachable_rigs.discard(ip)
+                notifier.send(f"Rig {ip} back online, now set to {level}.", level="info")
+        except (OSError, TimeoutError) as e:
+            log.warning(f"rig {ip} unreachable while setting {level}: {e}")
+            if ip not in unreachable_rigs:
+                unreachable_rigs.add(ip)
+                notifier.send(f"Rig {ip} unreachable while trying to set {level}: {e}", level="warn")
 
 
-def collect_rig_statuses(active_rig_ips: list) -> dict:
-    """Pulls live telemetry from each rig for the dashboard, plus what we
-    last commanded it to (separate from what it's actually doing, in case
-    a command failed). Never raises."""
+def collect_rig_statuses(commanded_level: str) -> dict:
+    """Live telemetry per rig for the dashboard, plus the level we believe
+    all rigs should be at. Never raises."""
     statuses = {}
     for ip in config.RIG_IPS:
         status = avalon_ctl.get_status(ip)
-        status["commanded_state"] = "max" if ip in active_rig_ips else "idle"
+        status["commanded_level"] = commanded_level
         statuses[ip] = status
     return statuses
 
 
-def build_daily_summary(power_kw, active_rig_ips: list, total_rigs: int) -> str:
+def probe_actual_level() -> str:
+    """
+    On startup, read the rigs' REAL current level rather than assuming idle.
+    Returns the HIGHEST level any reachable rig reports, so we err toward
+    "there's load running we need to manage" rather than losing track of a
+    rig left mining across a restart.
+    """
+    highest = "idle"
+    for ip in config.RIG_IPS:
+        status = avalon_ctl.get_status(ip)
+        if not status.get("reachable"):
+            continue
+        lvl = status.get("level", "idle")
+        if avalon_ctl.LEVEL_INDEX.get(lvl, 0) > avalon_ctl.LEVEL_INDEX.get(highest, 0):
+            highest = lvl
+    return highest
+
+
+def build_daily_summary(power_kw, current_level: str) -> str:
     runtime = daily_stats.get_runtime_seconds(config.RIG_IPS)
     power_stats = daily_stats.get_power_stats(config.RIG_IPS)
-    rig_power_est = getattr(config, "RIG_POWER_KW_ESTIMATE", 3.6)
 
     today_str = date.today().isoformat()
     today_epoch_start = time.mktime(time.strptime(today_str, "%Y-%m-%d"))
@@ -111,7 +126,7 @@ def build_daily_summary(power_kw, active_rig_ips: list, total_rigs: int) -> str:
 
     lines = [f"Daily summary -- {today_str}"]
     if power_kw is not None:
-        lines.append(f"Current: {power_kw:.1f}kW, {len(active_rig_ips)}/{total_rigs} rigs active")
+        lines.append(f"Current: {power_kw:.1f}kW, rigs at {current_level.upper()}")
     else:
         lines.append("Current: no data")
     lines.append(f"Events today: {len(events)} ({info_count} info, {warn_count} warnings, {error_count} errors)")
@@ -122,15 +137,22 @@ def build_daily_summary(power_kw, active_rig_ips: list, total_rigs: int) -> str:
             f"peak {power_stats['max']:.1f}kW, low {power_stats['min']:.1f}kW"
         )
 
-    total_hours = 0.0
     total_kwh = 0.0
     for ip in config.RIG_IPS:
-        hours = runtime.get(ip, 0.0) / 3600
-        kwh = hours * rig_power_est
-        total_hours += hours
-        total_kwh += kwh
-        lines.append(f"  {ip}: {hours:.1f}h active (~{kwh:.1f} kWh est.)")
-    lines.append(f"Total rig runtime: {total_hours:.1f}h, ~{total_kwh:.1f} kWh burned (est. at {rig_power_est}kW/rig)")
+        per_level = runtime.get(ip, {})
+        rig_kwh = 0.0
+        parts = []
+        for lvl in ("eco", "standard", "super"):
+            secs = per_level.get(lvl, 0.0) if isinstance(per_level, dict) else 0.0
+            if secs > 0:
+                hrs = secs / 3600
+                kwh = hrs * (avalon_ctl.LEVEL_WATTS[lvl] / 1000)
+                rig_kwh += kwh
+                parts.append(f"{lvl} {hrs:.1f}h")
+        total_kwh += rig_kwh
+        detail = ", ".join(parts) if parts else "idle all day"
+        lines.append(f"  {ip}: {detail} (~{rig_kwh:.1f} kWh)")
+    lines.append(f"Total est. energy burned: ~{total_kwh:.1f} kWh")
 
     if getattr(config, "F2POOL_ENABLED", False):
         lines.append(f2pool_api.get_daily_summary_line(config.F2POOL_CURRENCY, config.F2POOL_USERNAME, config.F2POOL_API_TOKEN))
@@ -146,30 +168,22 @@ def build_daily_summary(power_kw, active_rig_ips: list, total_rigs: int) -> str:
     return "\n".join(lines)
 
 
-def probe_actual_active_rigs() -> list:
+def decide_target_level(current_idx: int, power_kw: float) -> tuple:
     """
-    On startup, query each rig's REAL current state rather than assuming
-    none are active. Without this, a service restart (whether deliberate,
-    a crash, or a reboot) would reset the in-memory active_rig_ips to []
-    regardless of what the rig is physically doing -- if a rig was left
-    mining from an earlier manual override or a previous session, the
-    automatic idle-trigger logic would never fire for it, because it'd
-    believe there was nothing to turn off. This is exactly what caused a
-    rig to keep mining overnight after several service restarts during
-    testing: it wasn't idled by anything, because nothing thought it was
-    ever turned on in the first place.
+    Pure decision function: given the current level index and the export
+    reading, return (target_idx, immediate) where `immediate` means skip
+    the settle wait (only used for the fast-drop-to-idle case). Returns
+    current_idx unchanged when the right move is to hold.
     """
-    active = []
-    for ip in config.RIG_IPS:
-        status = avalon_ctl.get_status(ip)
-        if not status.get("reachable"):
-            continue
-        hashrate = status.get("hashrate_ths") or 0
-        fan = status.get("fan_pct")
-        looks_active = hashrate > 0 or (fan not in (None, "0", "0%"))
-        if looks_active:
-            active.append(ip)
-    return active
+    if power_kw >= RAMP_UP_KW:
+        return min(current_idx + 1, len(LEVELS) - 1), False
+    if power_kw >= HOLD_FLOOR_KW:
+        return current_idx, False
+    if power_kw >= DOWN1_FLOOR_KW:
+        return max(current_idx - 1, 0), False
+    if power_kw >= DOWN2_FLOOR_KW:
+        return max(current_idx - 2, 0), False
+    return 0, True
 
 
 def main():
@@ -177,18 +191,16 @@ def main():
         config.SOLIS_KEY_ID, config.SOLIS_KEY_SECRET, config.SOLIS_PLANT_ID
     )
 
-    total_rigs = len(config.RIG_IPS)
-    active_rig_ips = probe_actual_active_rigs()
+    current_level = probe_actual_level()
     consecutive_errors = 0
     unreachable_rigs = set()
     last_step_at = 0.0
     was_overridden = False
 
-    if active_rig_ips:
+    if current_level != "idle":
         notifier.send(
-            f"Solar miner controller started -- found {len(active_rig_ips)} rig(s) already "
-            f"actively mining on startup ({', '.join(active_rig_ips)}). Picking up from there "
-            f"rather than assuming they're idle.",
+            f"Solar miner controller started -- rigs already running at "
+            f"{current_level.upper()} on startup. Managing from there.",
             level="warn",
         )
     else:
@@ -205,15 +217,11 @@ def main():
             if not was_overridden:
                 notifier.send(f"Manual override active: rigs held at {override['mode'].upper()}.", level="info", telegram=False)
                 was_overridden = True
-            if override["mode"] == "max" and len(active_rig_ips) != total_rigs:
-                set_rigs("max", unreachable_rigs)
-                active_rig_ips = list(config.RIG_IPS)
+            target_level = "super" if override["mode"] == "max" else "idle"
+            if current_level != target_level:
+                set_all_rigs_level(target_level, unreachable_rigs)
+                current_level = target_level
                 last_step_at = now
-            elif override["mode"] == "idle" and len(active_rig_ips) != 0:
-                set_rigs("idle", unreachable_rigs)
-                active_rig_ips = []
-                last_step_at = now
-
             try:
                 power_kw = client.get_current_power_kw()
                 connection_ok = True
@@ -229,76 +237,51 @@ def main():
                 power_kw = client.get_current_power_kw()
                 connection_ok = True
                 consecutive_errors = 0
-                log.info(f"current export power: {power_kw:.1f} kW ({len(active_rig_ips)}/{total_rigs} rigs active)")
+                log.info(f"current export power: {power_kw:.1f} kW (rigs at {current_level})")
 
-                settled = (now - last_step_at) >= config.STEP_SETTLE_SEC
+                current_idx = avalon_ctl.LEVEL_INDEX[current_level]
+                target_idx, immediate = decide_target_level(current_idx, power_kw)
+                settled = (now - last_step_at) >= STEP_SETTLE_SEC
 
-                if power_kw >= config.RAMP_UP_KW and len(active_rig_ips) < total_rigs and settled:
-                    was_empty = len(active_rig_ips) == 0
-                    next_ip = next(ip for ip in config.RIG_IPS if ip not in active_rig_ips)
-                    if set_single_rig(next_ip, "max", unreachable_rigs):
-                        active_rig_ips.append(next_ip)
+                if target_idx != current_idx and (immediate or settled):
+                    was_idle = current_level == "idle"
+                    if target_idx > current_idx:
+                        new_idx = current_idx + 1   # up: one level at a time
+                    else:
+                        new_idx = target_idx         # down: may skip levels
+                    new_level = LEVELS[new_idx]
+
+                    set_all_rigs_level(new_level, unreachable_rigs)
+                    direction = "up" if new_idx > current_idx else "down"
+                    current_level = new_level
                     last_step_at = now
-                    msg = (
-                        f"Output at {power_kw:.1f}kW -> bringing {next_ip} to MAX "
-                        f"({len(active_rig_ips)}/{total_rigs} active). "
-                        f"Settling {config.STEP_SETTLE_SEC // 60}m before next step."
-                    )
-                    first_of_day = was_empty and daily_stats.should_notify_first_activation(config.RIG_IPS)
+
+                    msg = f"Output at {power_kw:.1f}kW -> stepping {direction} to {new_level.upper()}."
+                    first_of_day = was_idle and daily_stats.should_notify_first_activation(config.RIG_IPS)
                     notifier.send(msg, level="info", telegram=first_of_day)
                     if first_of_day:
                         daily_stats.mark_activation_notified(config.RIG_IPS)
-
-                elif power_kw <= config.RAMP_DOWN_KW and len(active_rig_ips) > 0 and settled:
-                    ip_to_idle = active_rig_ips.pop()
-                    if not set_single_rig(ip_to_idle, "idle", unreachable_rigs):
-                        active_rig_ips.append(ip_to_idle)  # put it back, command failed
-                    last_step_at = now
-                    notifier.send(
-                        f"Output at {power_kw:.1f}kW -> idling {ip_to_idle} "
-                        f"({len(active_rig_ips)}/{total_rigs} active). "
-                        f"Settling {config.STEP_SETTLE_SEC // 60}m before next step.",
-                        level="info", telegram=False,
-                    )
-                # else: in the hysteresis band, already correct, or still
-                # settling from the last step -- do nothing this cycle.
 
             except Exception as e:
                 consecutive_errors += 1
                 log.error(f"poll failed ({consecutive_errors} in a row): {e}")
                 if consecutive_errors == 3:
                     notifier.send(f"Can't reach SolisCloud (3+ failures in a row): {e}", level="warn")
-                if consecutive_errors >= 5 and len(active_rig_ips) > 0:
+                if consecutive_errors >= 5 and current_level != "idle":
                     log.warning("too many consecutive failures -- forcing rigs to IDLE as a safe default")
                     notifier.send("Lost contact with SolisCloud for a while -- forcing rigs to IDLE as a safety default.", level="error")
-                    set_rigs("idle", unreachable_rigs)
-                    active_rig_ips = []
+                    set_all_rigs_level("idle", unreachable_rigs)
+                    current_level = "idle"
                     last_step_at = now
 
         daily_stats.record_power_sample(power_kw, config.RIG_IPS)
 
-        control_state = "idle" if not active_rig_ips else ("max" if len(active_rig_ips) == total_rigs else "partial")
-        rig_statuses = collect_rig_statuses(active_rig_ips)
-
-        # Safety net: if we believe a rig is idle but it's actually still
-        # hashing (whatever the cause -- missed a restart-recovery case,
-        # a command silently failed to stick, manual physical
-        # intervention, etc.), re-issue idle and flag it loudly rather
-        # than silently trusting our own belief about its state.
-        for ip, status in rig_statuses.items():
-            if ip not in active_rig_ips and status.get("reachable") and (status.get("hashrate_ths") or 0) > 0:
-                notifier.send(
-                    f"Rig {ip} was believed idle but is actually hashing "
-                    f"({status.get('hashrate_ths')} TH/s) -- re-sending idle command.",
-                    level="warn",
-                )
-                set_single_rig(ip, "idle", unreachable_rigs)
-
-        state_store.write_state(power_kw, control_state, rig_statuses, connection_ok, override=override)
+        rig_statuses = collect_rig_statuses(current_level)
+        state_store.write_state(power_kw, current_level, rig_statuses, connection_ok, override=override)
 
         summary_hour = getattr(config, "DAILY_SUMMARY_HOUR", 18)
         if daily_stats.should_send_daily_summary(config.RIG_IPS, summary_hour):
-            notifier.send(build_daily_summary(power_kw, active_rig_ips, total_rigs), level="info", telegram=True)
+            notifier.send(build_daily_summary(power_kw, current_level), level="info", telegram=True)
             daily_stats.mark_summary_sent(config.RIG_IPS)
 
         notifier.flush()

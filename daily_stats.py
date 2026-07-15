@@ -1,7 +1,8 @@
 """
-Tracks running totals for the once-daily Telegram summary: per-rig active
-runtime (for the energy estimate), and today's power min/max/avg. Resets
-automatically the first time it's accessed after local midnight.
+Tracks running totals for the once-daily Telegram summary: per-rig time
+spent in each running level (for the energy estimate), and today's power
+min/max/avg. Resets automatically the first time it's accessed after local
+midnight.
 
 Kept separate from state_store.py's live state/override -- this data only
 matters in aggregate at summary time, not on every poll.
@@ -37,7 +38,8 @@ def _default(rig_ips: list) -> dict:
     now = time.time()
     return {
         "date": _today_str(),
-        "rig_seconds_accum": {ip: 0.0 for ip in rig_ips},
+        # per-rig: {level_name: seconds} accumulated in each running level
+        "rig_level_seconds": {ip: {} for ip in rig_ips},
         "rig_state": {ip: "idle" for ip in rig_ips},
         "rig_since": {ip: now for ip in rig_ips},
         "power_sum": 0.0,
@@ -50,13 +52,12 @@ def _default(rig_ips: list) -> dict:
 
 
 def _rollover(data: dict, rig_ips: list) -> dict:
-    """New day: zero the accumulators, keep each rig's current on/off
-    state as-is (an overnight session just starts counting fresh from
-    midnight rather than exactly on the boundary -- fine for a rough
-    daily estimate, not meant to be a precision energy meter)."""
+    """New day: zero the accumulators, keep each rig's current level as-is
+    (an ongoing session just starts counting fresh from midnight rather
+    than exactly on the boundary -- fine for a rough daily estimate)."""
     now = time.time()
     data["date"] = _today_str()
-    data["rig_seconds_accum"] = {ip: 0.0 for ip in rig_ips}
+    data["rig_level_seconds"] = {ip: {} for ip in rig_ips}
     data["rig_since"] = {ip: now for ip in rig_ips}
     data["power_sum"] = 0.0
     data["power_count"] = 0
@@ -73,7 +74,7 @@ def _load(rig_ips: list) -> dict:
         with open(DAILY_STATS_PATH) as f:
             data = json.load(f)
         for ip in rig_ips:
-            data.setdefault("rig_seconds_accum", {}).setdefault(ip, 0.0)
+            data.setdefault("rig_level_seconds", {}).setdefault(ip, {})
             data.setdefault("rig_state", {}).setdefault(ip, "idle")
             data.setdefault("rig_since", {}).setdefault(ip, time.time())
         if data.get("date") != _today_str():
@@ -92,32 +93,34 @@ def record_power_sample(power_kw, rig_ips: list):
     _atomic_write(DAILY_STATS_PATH, data)
 
 
-def record_rig_transition(ip: str, new_state: str, rig_ips: list):
-    """Call whenever a rig's commanded state actually changes. Adds the
-    time just spent in the OLD state to today's accumulator (only 'max'
-    time counts toward runtime/energy -- idle draws ~0)."""
+def record_rig_transition(ip: str, new_level: str, rig_ips: list):
+    """Call whenever a rig's level actually changes. Credits the time just
+    spent in the OLD level to that level's accumulator (idle time isn't
+    tracked -- it draws ~nothing and isn't needed for the energy sum)."""
     data = _load(rig_ips)
     now = time.time()
-    old_state = data["rig_state"].get(ip, "idle")
+    old_level = data["rig_state"].get(ip, "idle")
     since = data["rig_since"].get(ip, now)
-    if old_state == "max":
-        data["rig_seconds_accum"][ip] = data["rig_seconds_accum"].get(ip, 0.0) + max(0.0, now - since)
-    data["rig_state"][ip] = new_state
+    if old_level and old_level != "idle":
+        per = data["rig_level_seconds"].setdefault(ip, {})
+        per[old_level] = per.get(old_level, 0.0) + max(0.0, now - since)
+    data["rig_state"][ip] = new_level
     data["rig_since"][ip] = now
     _atomic_write(DAILY_STATS_PATH, data)
 
 
 def get_runtime_seconds(rig_ips: list) -> dict:
-    """Total active ('max') seconds today per rig, including whatever's
-    happened in the current session if it's still ongoing."""
+    """Per-rig {level: seconds} spent in each running level today,
+    including the current ongoing session if applicable."""
     data = _load(rig_ips)
     now = time.time()
     out = {}
     for ip in rig_ips:
-        accum = data["rig_seconds_accum"].get(ip, 0.0)
-        if data["rig_state"].get(ip) == "max":
-            accum += max(0.0, now - data["rig_since"].get(ip, now))
-        out[ip] = accum
+        per = dict(data["rig_level_seconds"].get(ip, {}))
+        cur = data["rig_state"].get(ip, "idle")
+        if cur and cur != "idle":
+            per[cur] = per.get(cur, 0.0) + max(0.0, now - data["rig_since"].get(ip, now))
+        out[ip] = per
     return out
 
 

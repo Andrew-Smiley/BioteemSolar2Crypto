@@ -358,3 +358,20 @@ main {
   .gauge-wrap { width: 200px; height: 200px; }
   .gauge-value { font-size: 36px; }
 }
+
+/* Level-based state pills (added for eco/standard/super control) */
+.state-pill.eco {
+  color: #fff;
+  background: linear-gradient(135deg, var(--green), var(--cyan));
+  border-color: transparent;
+}
+.state-pill.standard {
+  color: #fff;
+  background: linear-gradient(135deg, var(--cyan), var(--blue));
+  border-color: transparent;
+}
+.state-pill.super {
+  color: #fff;
+  background: linear-gradient(135deg, var(--blue), var(--violet));
+  border-color: transparent;
+}

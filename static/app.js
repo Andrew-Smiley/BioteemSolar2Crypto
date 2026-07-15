@@ -38,13 +38,9 @@ function renderGauge(powerKw) {
 }
 
 function renderStatePill(state, rigs) {
-  if (state === "partial" && rigs) {
-    const total = Object.keys(rigs).length;
-    const active = Object.values(rigs).filter((r) => r.commanded_state === "max").length;
-    statePill.textContent = `${active}/${total} MAX`;
-  } else {
-    statePill.textContent = state === "unknown" ? "—" : state.toUpperCase();
-  }
+  // Controller now reports a single shared level for both rigs:
+  // idle / eco / standard / super (or "partial"/"max" from older builds).
+  statePill.textContent = state === "unknown" ? "—" : state.toUpperCase();
   statePill.className = `state-pill ${state}`;
 }
 
@@ -64,6 +60,7 @@ function renderRigs(rigs) {
     .map((ip, i) => {
       const rig = rigs[ip];
       const online = rig.reachable;
+      const level = rig.level || rig.commanded_level || "—";
       const hashrate = rig.hashrate_ths != null ? `${rig.hashrate_ths.toFixed(1)}` : "--";
       const temp = rig.temp_c != null ? `${rig.temp_c.toFixed(0)}°` : "--";
       return `
@@ -73,7 +70,7 @@ function renderRigs(rigs) {
               <div class="rig-name">Rig ${i + 1}</div>
               <span class="rig-ip">${ip}</span>
             </div>
-            <span class="rig-badge ${online ? "online" : "offline"}">${online ? "online" : "offline"}</span>
+            <span class="rig-badge ${online ? "online" : "offline"}">${online ? level : "offline"}</span>
           </div>
           <div class="rig-stats">
             <div>
