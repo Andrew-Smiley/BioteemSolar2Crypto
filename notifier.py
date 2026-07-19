@@ -28,11 +28,21 @@ _LEVEL_PREFIX = {"info": "\u2139\ufe0f", "warn": "\u26a0\ufe0f", "error": "\U000
 
 
 def _broadcast_targets() -> list:
-    targets = [config.TELEGRAM_CHAT_ID]
+    """
+    Where controller notifications go. If a broadcast channel is
+    configured, send ONLY there -- the owner is a subscriber of that
+    channel too, so also DMing the bot would just double every message.
+    Only when there's no channel do we fall back to the personal DM.
+
+    (This applies to controller-initiated notifications like the daily
+    summary and alerts. Direct replies to bot commands in the DM are
+    handled separately in telegram_listener.py and still go back to
+    whoever sent the command.)
+    """
     channel_id = getattr(config, "TELEGRAM_CHANNEL_CHAT_ID", None)
     if channel_id:
-        targets.append(channel_id)
-    return targets
+        return [channel_id]
+    return [config.TELEGRAM_CHAT_ID]
 
 
 def send(message: str, level: str = "info", telegram: bool = None):

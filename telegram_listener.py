@@ -120,12 +120,15 @@ def apply_manual_command(mode: str) -> str:
         except (OSError, TimeoutError) as e:
             results.append(f"{ip}: unreachable ({e})")
 
-    state_store.set_override(mode, ttl_seconds=OVERRIDE_TTL_SEC)
-    ttl_hours = OVERRIDE_TTL_SEC / 3600
-    return (
-        f"Manual override set: {level.upper()} for up to {ttl_hours:.1f}h "
-        f"(or until you send \"auto\").\n" + "\n".join(results)
-    )
+    if mode == "idle":
+        state_store.set_override(mode, ttl_seconds=None)  # hold until cleared
+        header = "Manual override set: IDLE (held until you send \"auto\" or another level)."
+    else:
+        state_store.set_override(mode, ttl_seconds=OVERRIDE_TTL_SEC)
+        ttl_hours = OVERRIDE_TTL_SEC / 3600
+        header = f"Manual override set: {level.upper()} for up to {ttl_hours:.1f}h (or until you send \"auto\")."
+
+    return header + "\n" + "\n".join(results)
 
 
 def clear_manual_override() -> str:
