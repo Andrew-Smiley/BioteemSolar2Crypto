@@ -1,0 +1,16 @@
+[Unit]
+Description=Bioteem four-button e-paper dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/waveshare-2in7-v2
+Environment=GPIOZERO_PIN_FACTORY=lgpio
+ExecStart=/home/admin/display_env/bin/python -u /home/admin/waveshare-2in7-v2/solar_dashboard.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
