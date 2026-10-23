@@ -193,6 +193,8 @@ def main():
 
     current_level = probe_actual_level()
     consecutive_errors = 0
+    cloud_failure_since = None
+    cloud_outage_alerted = False
     unreachable_rigs = set()
     last_step_at = 0.0
     was_overridden = False
@@ -265,14 +267,41 @@ def main():
             except Exception as e:
                 consecutive_errors += 1
                 log.error(f"poll failed ({consecutive_errors} in a row): {e}")
-                if consecutive_errors == 3:
-                    notifier.send(f"Can't reach SolisCloud (3+ failures in a row): {e}", level="warn")
                 if consecutive_errors >= 5 and current_level != "idle":
                     log.warning("too many consecutive failures -- forcing rigs to IDLE as a safe default")
                     notifier.send("Lost contact with SolisCloud for a while -- forcing rigs to IDLE as a safety default.", level="error")
                     set_all_rigs_level("idle", unreachable_rigs)
                     current_level = "idle"
                     last_step_at = now
+
+        # Notify only for sustained cloud failures, including in override.
+        # The existing five-failure idle protection remains independent.
+        cloud_now = time.monotonic()
+        if connection_ok:
+            if cloud_outage_alerted:
+                outage_minutes = (cloud_now - cloud_failure_since) / 60
+                notifier.send(
+                    f"SolisCloud connection recovered after approximately "
+                    f"{outage_minutes:.0f} minutes of failed requests.",
+                    level="info",
+                    telegram=True,
+                )
+            cloud_failure_since = None
+            cloud_outage_alerted = False
+        else:
+            if cloud_failure_since is None:
+                cloud_failure_since = cloud_now
+            if (
+                not cloud_outage_alerted
+                and cloud_now - cloud_failure_since >= 600
+            ):
+                notifier.send(
+                    "SolisCloud requests have been failing for at least "
+                    "10 minutes. Check the controller logs for details.",
+                    level="warn",
+                    telegram=True,
+                )
+                cloud_outage_alerted = True
 
         daily_stats.record_power_sample(power_kw, config.RIG_IPS)
 
