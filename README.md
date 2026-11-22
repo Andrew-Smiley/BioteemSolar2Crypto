@@ -167,3 +167,27 @@ override manually -- likely less code to maintain than a bespoke Pi
 script, at the cost of running HA. Worth it if you already have HA or
 plan to add more automation later; probably overkill if this is the only
 thing you're automating.
+
+
+## Seasonal modes
+
+Send `summer` or `/summer` in the authorized Telegram chat/channel for
+the existing solar-based level control. Send `winter` or `/winter` for
+continuous Super/max on both miners, regardless of solar output or
+SolisCloud availability. Solar telemetry and the e-paper daily graph
+continue in both modes. Winter can use grid power.
+
+Summer is the default. The selection is stored locally in `season.json`
+and survives restarts. Existing manual overrides take priority: `idle`
+still holds until cleared; `auto` clears the override and resumes the
+selected season (it does not select Summer). Seasonal commands apply on
+the next controller poll. Status reports selected and applied seasons.
+
+The e-paper screen shows a sun for Summer and a snowman for Winter in the
+top-right corner on every page. It refreshes when the controller publishes
+a season change. A retained e-paper image may be stale if the controller
+or display is offline.
+
+After updating the repository on the Pi, copy `epaper/solar_dashboard.py`
+to `/home/admin/waveshare-2in7-v2/solar_dashboard.py` and restart
+`solar-miner`, `solar-telegram-listener`, and `solar-epaper`.

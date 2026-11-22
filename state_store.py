@@ -18,6 +18,7 @@ from collections import deque
 
 STATE_PATH = "/home/admin/solar_miner_controller/state.json"
 OVERRIDE_PATH = "/home/admin/solar_miner_controller/override.json"
+SEASON_PATH = "/home/admin/solar_miner_controller/season.json"
 MAX_EVENTS = 1000
 
 _events = deque(maxlen=MAX_EVENTS)
@@ -50,7 +51,7 @@ def get_events() -> list:
     return list(_events)
 
 
-def write_state(power_kw, control_state, rigs: dict, connection_ok: bool, override: dict = None):
+def write_state(power_kw, control_state, rigs: dict, connection_ok: bool, override: dict = None, season: str = "summer"):
     """
     power_kw: float or None (None if we currently can't reach SolisCloud)
     control_state: 'idle' | 'max' | 'unknown'
@@ -69,6 +70,7 @@ def write_state(power_kw, control_state, rigs: dict, connection_ok: bool, overri
         "rigs": rigs,
         "events": get_events(),
         "override": override,
+        "season": season,
     }
     _atomic_write(STATE_PATH, data)
 
@@ -138,3 +140,21 @@ def get_verbose() -> bool:
     with open(VERBOSE_PATH) as f:
         data = json.load(f)
     return bool(data.get("enabled", False))
+
+
+def set_season(season: str):
+    """Persist the selected season independently of temporary overrides."""
+    if season not in ("summer", "winter"):
+        raise ValueError("Season must be summer or winter")
+    _atomic_write(SEASON_PATH, {"season": season})
+
+
+def get_season() -> str:
+    """Existing installations default to solar control; fail closed on bad data."""
+    try:
+        with open(SEASON_PATH) as source:
+            data = json.load(source)
+        season = data.get("season") if isinstance(data, dict) else None
+        return season if season in ("summer", "winter") else "summer"
+    except (OSError, ValueError):
+        return "summer"

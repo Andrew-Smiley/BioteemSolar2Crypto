@@ -4,6 +4,7 @@ Install alongside waveshare_epd in /home/admin/waveshare-2in7-v2.
 Run with GPIOZERO_PIN_FACTORY=lgpio /home/admin/display_env/bin/python.
 """
 
+import math
 import json
 import os
 import subprocess
@@ -138,11 +139,11 @@ def draw_now(draw, state, fresh, solar, health):
     power = solar.get('power_kw') if health != 'unavailable' else None
     day = solar.get('day_kwh') if health != 'unavailable' else None
     if power is None or day is None:
-        text(draw, (7, 24), 'Solis data unavailable', 13)
+        text(draw, (7, 32), 'Solis data unavailable', 13)
     else:
-        text(draw, (7, 24), f'{power:.1f} kW   Today {day:.1f} kWh', 13)
+        text(draw, (7, 32), f'{power:.1f} kW   Today {day:.1f} kWh', 13)
 
-    left, right, top, bottom = 13, 255, 50, 110
+    left, right, top, bottom = 13, 255, 54, 110
     now = datetime.now(ZONE)
     start = 6.0
     end = max(12.0, now.hour + now.minute / 60 + 0.5)
@@ -171,8 +172,8 @@ def draw_now(draw, state, fresh, solar, health):
         text(draw, (8, 133 + 18 * (index - 1)),
              f'M{index}  {miner_status(rig, fresh)}', 13)
     if health == 'cached' or not fresh:
-        draw.rectangle((176, 1, 263, 20), fill=255)
-        text(draw, (177, 2), 'DATA OLD', 10)
+        draw.rectangle((165, 1, 229, 20), fill=255)
+        text(draw, (166, 3), 'DATA OLD', 9)
 
 
 def draw_solar(draw, solar, health):
@@ -233,6 +234,30 @@ def draw_events(draw, state, fresh):
         text(draw, (8, y + 13), message[:38], 10)
 
 
+def draw_season(draw, season):
+    """High-contrast vector icons: no emoji font dependency on the Pi."""
+    if season == 'winter':
+        draw.ellipse((241, 12, 257, 29), fill=255, outline=0, width=2)
+        draw.ellipse((244, 4, 254, 15), fill=255, outline=0, width=2)
+        draw.rectangle((244, 1, 253, 5), fill=0)
+        draw.line((241, 5, 257, 5), fill=0, width=2)
+        draw.point((247, 9), fill=0)
+        draw.point((251, 9), fill=0)
+        draw.line((248, 12, 253, 12), fill=0)
+        draw.line((243, 16, 255, 16), fill=0, width=2)
+        draw.line((241, 20, 235, 14), fill=0, width=2)
+        draw.line((257, 20, 262, 14), fill=0, width=2)
+        for y in (20, 24):
+            draw.ellipse((248, y, 250, y + 2), fill=0)
+    else:
+        draw.ellipse((242, 8, 256, 22), fill=0)
+        for i in range(8):
+            angle = math.pi * i / 4
+            draw.line((249 + 11 * math.cos(angle), 15 + 11 * math.sin(angle),
+                       249 + 14 * math.cos(angle), 15 + 14 * math.sin(angle)),
+                      fill=0, width=2)
+
+
 def render(page):
     from PIL import Image, ImageDraw
 
@@ -250,6 +275,8 @@ def render(page):
         draw_events(draw, state, fresh)
     else:
         raise ValueError(f'Unknown page: {page}')
+
+    draw_season(draw, state.get('season', 'summer'))
 
     from waveshare_epd import epd2in7_V2
     epd = epd2in7_V2.EPD()
@@ -271,9 +298,18 @@ def watch():
     last_button = time.monotonic()
     last_draw = 0
     needs_draw = True
+    last_season = None
+    next_state_check = 0
     try:
         while True:
             now = time.monotonic()
+            if now >= next_state_check:
+                state, _ = state_data()
+                season = state.get('season', 'summer')
+                if season != last_season:
+                    needs_draw = True
+                    last_season = season
+                next_state_check = now + 1
             for pin, button in buttons.items():
                 pressed = button.is_pressed
                 if pressed and not previous[pin]:

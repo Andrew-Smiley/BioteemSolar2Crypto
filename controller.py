@@ -198,6 +198,7 @@ def main():
     unreachable_rigs = set()
     last_step_at = 0.0
     was_overridden = False
+    previous_season = None
 
     if current_level != "idle":
         notifier.send(
@@ -213,6 +214,7 @@ def main():
         connection_ok = False
         now = time.time()
 
+        season = state_store.get_season()
         override = state_store.get_override()
 
         if override:
@@ -229,6 +231,21 @@ def main():
                 connection_ok = True
             except Exception as e:
                 log.warning(f"poll failed during override: {e}")
+
+        elif season == "winter":
+            was_overridden = False
+            consecutive_errors = 0
+            # Solar is telemetry only in winter. Retry rigs that were unreachable.
+            if previous_season != "winter" or current_level != "super" or unreachable_rigs:
+                set_all_rigs_level("super", unreachable_rigs)
+                current_level = "super"
+                last_step_at = now
+            try:
+                power_kw = client.get_current_power_kw()
+                connection_ok = True
+                log.info(f"Winter: export {power_kw:.1f} kW, rigs commanded SUPER")
+            except Exception as e:
+                log.warning(f"Winter solar telemetry failed (mining continues): {e}")
 
         else:
             if was_overridden:
@@ -306,7 +323,9 @@ def main():
         daily_stats.record_power_sample(power_kw, config.RIG_IPS)
 
         rig_statuses = collect_rig_statuses(current_level)
-        state_store.write_state(power_kw, current_level, rig_statuses, connection_ok, override=override)
+        state_store.write_state(power_kw, current_level, rig_statuses, connection_ok, override=override, season=season)
+
+        previous_season = season
 
         summary_hour = getattr(config, "DAILY_SUMMARY_HOUR", 18)
         if daily_stats.should_send_daily_summary(config.RIG_IPS, summary_hour):

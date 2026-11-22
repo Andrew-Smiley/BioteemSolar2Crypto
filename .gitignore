@@ -7,3 +7,5 @@ controller.log
 __pycache__/
 *.pyc
 venv/
+season.json
+backups/

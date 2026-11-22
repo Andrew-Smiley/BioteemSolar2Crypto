@@ -36,6 +36,8 @@ MAX_COMMANDS = {"max", "super", "/max", "/super"}
 AUTO_COMMANDS = {"auto", "resume", "/auto", "/resume"}
 VERBOSE_COMMANDS = {"verbose", "live", "/verbose", "/live"}
 QUIET_COMMANDS = {"quiet", "normal", "/quiet", "/normal"}
+SUMMER_COMMANDS = {"summer", "/summer"}
+WINTER_COMMANDS = {"winter", "/winter"}
 HELP_COMMANDS = {"help", "/help", "commands", "/commands", "?"}
 
 HELP_TEXT = (
@@ -43,7 +45,9 @@ HELP_TEXT = (
     "  status -- current power/rig state\n"
     "  idle -- force rigs to idle (manual override)\n"
     "  max / super -- force rigs to super/max (manual override)\n"
-    "  auto -- cancel manual override, resume automatic control\n"
+    "  summer -- solar-controlled mining (default)\n"
+    "  winter -- continuous Super/max, solar graph stays live\n"
+    "  auto -- cancel manual override, resume selected season\n"
     "  verbose / live -- get every event immediately instead of "
     "waiting for the 6pm daily summary\n"
     "  quiet / normal -- back to normal: only first activation of the "
@@ -64,7 +68,8 @@ def format_status() -> str:
     updated_at = state.get("updated_at")
     override = state.get("override")
 
-    lines = []
+    lines = [f"Season selected: {state_store.get_season().upper()}",
+             f"Controller season: {state.get('season', 'summer').upper()}"]
     if power is None:
         lines.append("Power: no data (can't reach SolisCloud right now)")
     else:
@@ -135,7 +140,7 @@ def clear_manual_override() -> str:
     had_override = state_store.get_override() is not None
     state_store.clear_override()
     if had_override:
-        return "Manual override cleared -- automatic control resumes on the next poll."
+        return f"Manual override cleared -- {state_store.get_season().upper()} mode resumes on the next poll."
     return "No manual override was active."
 
 
@@ -161,9 +166,23 @@ def set_verbose_mode(enabled: bool) -> str:
     return "Back to normal: only first activation of the day + warnings/errors ping immediately. Everything else in the 6pm summary."
 
 
+def select_season(season: str) -> str:
+    state_store.set_season(season)
+    detail = ("solar-controlled mining" if season == "summer"
+              else "continuous Super/max; solar remains visible")
+    message = f"{season.upper()} selected: {detail}. Applies on the next controller poll."
+    if state_store.get_override():
+        message += ' Manual override remains active; send "auto" to clear it.'
+    return message
+
+
 def handle_text(text: str) -> str:
     normalized = text.strip().lower()
 
+    if normalized in SUMMER_COMMANDS:
+        return select_season("summer")
+    if normalized in WINTER_COMMANDS:
+        return select_season("winter")
     if normalized in IDLE_COMMANDS:
         return apply_manual_command("idle")
     if normalized in MAX_COMMANDS:
